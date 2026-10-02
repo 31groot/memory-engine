@@ -129,10 +129,7 @@ I intentionally kept the project lightweight:
 * Optional `rank_bm25`
 * Optional `python-dateutil`
 * Optional OpenAI-compatible LLM endpoint
-* No PostgreSQL
-* No pgvector
-* No Docker
-* No external vector database
+
 
 ## Repository layout
 
