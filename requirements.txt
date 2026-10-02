@@ -1,0 +1,3 @@
+# Optional / lightweight. The code includes a stdlib BM25 fallback if rank_bm25 is unavailable.
+rank_bm25>=0.2.2
+python-dateutil>=2.8
