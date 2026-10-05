@@ -1,0 +1,239 @@
+{
+  "summary": {
+    "n": 14,
+    "pass_rate": 1.0,
+    "arg_accuracy": 1.0
+  },
+  "items": [
+    {
+      "id": "ACT-HO-01",
+      "command": "Email Dave Morales that the launch is now October 21",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "gmail.send",
+          "args": {
+            "to": [
+              "dave.morales@pinecrestcarriers.example.com"
+            ],
+            "cc": [],
+            "subject": "Launch now october 21",
+            "body": "Hi Dave,\n\nThe launch is now October 21.\n\nThanks,\nAlex"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-02",
+      "command": "Tell Ben on Slack to pull weekly active dispatchers for Pinecrest",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "slack.send_message",
+          "args": {
+            "to": "U06BEN",
+            "text": "To pull weekly active dispatchers for Pinecrest."
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-03",
+      "command": "Remind me tomorrow at 10am to send the board pre-read",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "reminder.create",
+          "args": {
+            "text": "send the board pre-read",
+            "due": "2026-09-19T10:00:00-07:00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-04",
+      "command": "Move the board pre-read review to 2pm",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "calendar.update_event",
+          "args": {
+            "event_id": "CAL-F-18",
+            "start": "2026-09-21T14:00:00-07:00",
+            "end": "2026-09-21T15:00:00-07:00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-05",
+      "command": "Schedule 45 minutes with Priya on Monday at 11 to go over the regression failures",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "calendar.create_event",
+          "args": {
+            "title": "Priya / Alex: the regression failures",
+            "start": "2026-09-21T11:00:00-07:00",
+            "end": "2026-09-21T11:45:00-07:00",
+            "attendees": [
+              "priya@brightline.example.com"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-06",
+      "command": "Open Linear",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "app.open",
+          "args": {
+            "app": "Linear"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-07",
+      "command": "Delete all emails from PipelinePilot",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "confirm",
+          "args": {
+            "summary": "Delete all emails from PipelinePilot? This can't be undone."
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-08",
+      "command": "Message Sarah about the launch readiness meeting",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "clarify",
+          "args": {
+            "question": "Which Sarah do you mean: Sarah Kim or Sarah Patel?"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-09",
+      "command": "What's the p95 latency again?",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "memory.ask",
+          "args": {
+            "question": "What's the p95 latency again?"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-10",
+      "command": "Remind me 30 minutes before launch readiness to bring the checklist",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "reminder.create",
+          "args": {
+            "text": "bring the checklist",
+            "due": "2026-09-22T10:30:00-07:00"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-11",
+      "command": "Email Leah Brooks and ask her to share the Jordan Ellis reference notes",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "gmail.send",
+          "args": {
+            "to": [
+              "leah@brightline.example.com"
+            ],
+            "cc": [],
+            "subject": "Re: Jordan Ellis \u2013 next steps",
+            "body": "Hi Leah,\n\nAsk her to share the Jordan Ellis reference notes.\n\nThanks,\nAlex"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-12",
+      "command": "Ping Dana on Slack that the mockups look great",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "slack.send_message",
+          "args": {
+            "to": "U04DANA",
+            "text": "The mockups look great."
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-13",
+      "command": "Cancel my dentist appointment",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "confirm",
+          "args": {
+            "summary": "Cancel \u201cDentist \u2013 Bayview Dental\u201d (event CAL-F-20)? Attendees will be notified.",
+            "event_id": "CAL-F-20"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ACT-HO-14",
+      "command": "Email Marcus the pricing proposal and remind me to follow up on Friday at 9am",
+      "pass": true,
+      "arg_accuracy": 1.0,
+      "predicted": [
+        {
+          "type": "gmail.send",
+          "args": {
+            "to": [
+              "marcus@brightline.example.com"
+            ],
+            "cc": [],
+            "subject": "Re: Brightline pricing proposal \u2013 Acme Freight",
+            "body": "Hi Marcus,\n\nThe pricing proposal.\n\nThanks,\nAlex"
+          }
+        },
+        {
+          "type": "reminder.create",
+          "args": {
+            "text": "follow up",
+            "due": "2026-09-18T09:00:00-07:00"
+          }
+        }
+      ]
+    }
+  ]
+}

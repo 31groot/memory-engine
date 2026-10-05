@@ -1,0 +1,180 @@
+{
+  "summary": {
+    "judge": "none",
+    "n": 14,
+    "strict": {
+      "n": 14,
+      "clusters": 14,
+      "mean": 0.7857,
+      "ci95": [
+        0.5714,
+        1.0
+      ]
+    },
+    "lenient": {
+      "n": 14,
+      "clusters": 14,
+      "mean": 0.7857,
+      "ci95": [
+        0.5714,
+        1.0
+      ]
+    },
+    "unverified": 0,
+    "hard_failures": 0,
+    "source_recall": 0.8333,
+    "source_precision": 0.5694,
+    "by_category": {
+      "abstention": 1.0,
+      "as_of_time_travel": 0.5,
+      "commitment_status": 0.5,
+      "cross_source": 1.0,
+      "knowledge_update": 0.5,
+      "single_fact": 1.0,
+      "temporal": 1.0
+    },
+    "accuracy": 0.7857
+  },
+  "items": [
+    {
+      "id": "MEM-HO-01",
+      "storyline": null,
+      "category": "as_of_time_travel",
+      "verdict": "incorrect",
+      "unverified": false,
+      "score": 0.0,
+      "lenient": 0.0,
+      "reason": "missing key term: sep 30"
+    },
+    {
+      "id": "MEM-HO-02",
+      "storyline": null,
+      "category": "knowledge_update",
+      "verdict": "incorrect",
+      "unverified": false,
+      "score": 0.0,
+      "lenient": 0.0,
+      "reason": "missing key term: oct 21"
+    },
+    {
+      "id": "MEM-HO-03",
+      "storyline": null,
+      "category": "single_fact",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-04",
+      "storyline": null,
+      "category": "commitment_status",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-05",
+      "storyline": null,
+      "category": "as_of_time_travel",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-06",
+      "storyline": null,
+      "category": "commitment_status",
+      "verdict": "incorrect",
+      "unverified": false,
+      "score": 0.0,
+      "lenient": 0.0,
+      "reason": "missing key term: reference check"
+    },
+    {
+      "id": "MEM-HO-07",
+      "storyline": null,
+      "category": "single_fact",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-08",
+      "storyline": null,
+      "category": "knowledge_update",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-09",
+      "storyline": null,
+      "category": "cross_source",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-10",
+      "storyline": null,
+      "category": "abstention",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "abstained"
+    },
+    {
+      "id": "MEM-HO-11",
+      "storyline": null,
+      "category": "abstention",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "abstained"
+    },
+    {
+      "id": "MEM-HO-12",
+      "storyline": null,
+      "category": "single_fact",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-13",
+      "storyline": null,
+      "category": "single_fact",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    },
+    {
+      "id": "MEM-HO-14",
+      "storyline": null,
+      "category": "temporal",
+      "verdict": "correct",
+      "unverified": false,
+      "score": 1.0,
+      "lenient": 1.0,
+      "reason": "all rules pass"
+    }
+  ]
+}

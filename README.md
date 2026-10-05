@@ -66,6 +66,19 @@ For example, a delete request produces a `confirm` result instead of performing 
 
 Name references are resolved from the contact directory built from the data (restricted to the channel the command names, e.g. Slack); if more than one person matches, the planner asks which one.
 
+## What didn't work
+
+* **Benchmark-specific rules.** My first version hit 100% on train by hardcoding answer strings,
+  record IDs and per-question branches. It could not generalize, so I removed it. Train memory
+  accuracy dropped to 48% when I did.
+* **Offline extractive answers.** Selecting sentences from retrieved records handles single facts
+  well (held-out strict 78.6%) but struggles on multi-part and synthesized questions. An LLM
+  back end is supported but not what the reported numbers use.
+* **Source citations.** Citation recall is about 0.51 on train; the cited records often miss
+  part of the evidence.
+* **Held-out contamination.** I fixed one action-parsing gap after seeing a held-out failure, so
+  the held-out split is a development check, not a clean test.
+
 ## Known limitations
 
 I made a few deliberate trade-offs to keep the implementation small and deterministic:
