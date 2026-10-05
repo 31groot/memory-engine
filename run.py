@@ -52,6 +52,17 @@ def main() -> None:
             [sys.executable, "eval_harness/score_memory.py", "--gold", memory_input, "--answers", memory_output, "--judge", "none", "--out", str(out_dir / "results_memory.json")],
             [sys.executable, "eval_harness/score_actions.py", "--gold", actions_input, "--predictions", actions_output, "--out", str(out_dir / "results_actions.json")],
         ]
+        # Held-out split (never used while developing the rules) is scored the same way.
+        ho_mem, ho_act = f"{ns.evals}/memory_heldout.jsonl", f"{ns.evals}/actions_heldout.jsonl"
+        if Path(ho_mem).exists() and Path(ho_act).exists():
+            ho_mem_out, ho_act_out = str(out_dir / "memory_answers_heldout.jsonl"), str(out_dir / "action_predictions_heldout.jsonl")
+            run_memory(ho_mem, ho_mem_out, ns.data)
+            run_actions(ho_act, ho_act_out, ns.data)
+            commands += [
+                [sys.executable, "eval_harness/score_retrieval.py", "--gold", ho_mem, "--answers", ho_mem_out, "--out", str(out_dir / "heldout_retrieval.json")],
+                [sys.executable, "eval_harness/score_memory.py", "--gold", ho_mem, "--answers", ho_mem_out, "--judge", "none", "--out", str(out_dir / "heldout_memory.json")],
+                [sys.executable, "eval_harness/score_actions.py", "--gold", ho_act, "--predictions", ho_act_out, "--out", str(out_dir / "heldout_actions.json")],
+            ]
         for cmd in commands:
             print("\n$", " ".join(cmd))
             subprocess.run(cmd, check=True)

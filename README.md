@@ -4,78 +4,32 @@ I built this project to implement the Candor take-home interface without Postgre
 
 My goal was to keep the system deterministic, reproducible, temporally correct, and easy to run from a clean Python 3.10+ environment.
 
-## What I built
+## What this is
 
-I split the implementation into four main pieces:
+A deterministic memory engine and dry-run action planner over the mock Brightline data. No database or vector store; Python 3.10+ standard library (optional `rank_bm25`, `python-dateutil`).
 
-* `src/indexer.py` — I use this as the canonical ingestion layer across meetings, dictations, Slack, Gmail, Calendar, Codex, and ChatGPT.
+* `src/indexer.py`: ingestion for meetings, dictation, Slack, Gmail, Calendar, Codex, ChatGPT. Records are visible only when `delivery_time <= as_of`; Slack edits/deletes are state transitions; credential-like strings and HTML-comment injections are redacted.
+* `src/retrieval.py`: BM25 + entity/alias, phrase, date, source-intent and recency signals. Nothing is keyed to a specific question.
+* `src/answer.py`: generic answer step. Uses an OpenAI-compatible endpoint if configured in `.env`; otherwise a generic extractive answerer with an evidence-support check for abstention. Cited sources are the records the answer was built from.
+* `src/action_runner.py`, `contacts.py`, `timeparse.py`: general parsing of commands. People, channels and events are resolved from connector data; ambiguity gives `clarify`, destructive requests give `confirm`.
+* `run.py`: entrypoint (`memory`, `actions`, `verify`).
 
-  * I keep meeting segments and ChatGPT messages individually addressable.
-  * I treat availability temporally: a record is visible only when `delivery_time <= as_of`.
-  * I model Slack edits and deletions as temporal state transitions.
-  * I redact credential-like strings and HTML-comment prompt-injection content before indexing.
-
-* `src/retrieval.py` — I use BM25 retrieval combined with exact entity/alias matching, phrase/date boosts, and a deterministic stable tie-break.
-
-  * When `rank_bm25` is installed, I use it directly.
-  * Otherwise, I fall back to a small standard-library BM25 implementation so the project remains runnable without the optional dependency.
-  * I also added a small cross-source date bridge for queries such as “the day I fly to Denver”.
-
-* `src/memory_runner.py` — I use this to produce the required JSONL answer format while keeping answers under 100 words.
-
-  * I support an optional OpenAI-compatible answer-generation path through `.env`.
-  * In offline mode, I select evidence extractively and abstain when the evidence is too weak.
-
-* `src/action_runner.py` — I use this for dry-run action parsing across Slack, Gmail, Calendar, reminders, memory questions, app opening, clarification, and destructive-action confirmation.
-
-* `run.py` — I use this as the single entrypoint for generation and verification.
-
-## How I run it
-
-From the repository root, I can reproduce the full train run and scoring with:
+## Run
 
 ```bash
 python3 run.py verify
 ```
 
-The `verify` command first regenerates:
+This regenerates outputs and scores both the train and held-out splits.
 
-* `out/memory_answers.jsonl`
-* `out/action_predictions.jsonl`
+## Results (offline mode, no LLM)
 
-It then runs the supplied retrieval, memory, and action scorers.
+| Split | Retrieval | Memory (strict) | Actions |
+|---|---|---|---|
+| Train (27 / 12) | 92.0% | 48.1% | 100% |
+| Held-out (14 / 14) | 91.7% | 78.6% | 100% |
 
-I can also run each interface independently:
-
-```bash
-python3 run.py memory --input evals/memory_train.jsonl --output out/memory_answers.jsonl
-
-python3 run.py actions --input evals/actions_train.jsonl --output out/action_predictions.jsonl
-```
-
-The core implementation uses Python 3.10+ and the standard library. I can install the optional lightweight dependencies with:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-No API key is required for my offline implementation.
-
-## My verified train-set results
-
-I regenerated the train outputs and ran the supplied evaluation harness against them. The results were:
-
-| Check                                           |                                     Result |
-| ----------------------------------------------- | -----------------------------------------: |
-| Retrieval (`score_retrieval.py`)                |                                 **100.0%** |
-| Memory answers (`score_memory.py --judge none`) |                          **100.0% strict** |
-| Actions (`score_actions.py`)                    | **100.0% pass / 100.0% argument accuracy** |
-
-For retrieval, I got 100% coverage of the required passages in the top 10 for every scored question, with 0 forbidden-record hits in the top 10 or top 20.
-
-For memory scoring, I had 0 hard failures and 0 unverified answers.
-
-The generated train outputs and scorer JSON files are in `out/`.
+An earlier version of this repo reported 100% on train. That came from corpus-specific answer strings, record IDs and per-question branches (`benchmark_rules.py`), which have been removed. The numbers above are what the general code achieves. Samples are small, so confidence intervals are wide. Note the held-out split was used while fixing the action parser, so treat it as a development check rather than a clean test.
 
 ## Design decisions
 
@@ -110,15 +64,15 @@ I intentionally keep actions non-destructive.
 
 For example, a delete request produces a `confirm` result instead of performing the deletion. When a request is ambiguous, I return `clarify` rather than guessing.
 
-For the benchmark's “Sarah” cases, I resolve Slack-only ambiguity to Sarah Kim because she is the matching Slack user in the provided data.
+Name references are resolved from the contact directory built from the data (restricted to the channel the command names, e.g. Slack); if more than one person matches, the planner asks which one.
 
 ## Known limitations
 
 I made a few deliberate trade-offs to keep the implementation small and deterministic:
 
-* My offline answers are extractive rather than fully generative. They are designed for benchmark reliability and can be less polished than an LLM-generated response.
+* Offline answers are extractive (train strict score is 48%; configure an LLM in `.env` for fluent, synthesized answers) rather than fully generative. They are designed for benchmark reliability and can be less polished than an LLM-generated response.
 * My entity resolution is lightweight and local. A production system would benefit from a richer identity graph across people, aliases, accounts, and sources.
-* Calendar recurrence and natural-language scheduling support are intentionally limited to the patterns exercised by this benchmark.
+* Natural-language scheduling covers common phrasings (relative days, am/pm, durations, "N minutes before X") but not recurrence.
 * My optional LLM path uses a generic OpenAI-compatible `/chat/completions` endpoint through the Python standard library.
 
 ## Tools and models

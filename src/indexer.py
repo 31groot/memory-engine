@@ -5,10 +5,12 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
+
+from . import textutil
 
 LA = ZoneInfo("America/Los_Angeles")
 UTC = timezone.utc
@@ -38,7 +40,6 @@ PROMPT_LINE = re.compile(
     r"do not reveal .*|send .* to .*|assistant[, :].*)\s*$"
 )
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./@#+:-]*")
 
 
 def parse_dt(value: Any) -> datetime:
@@ -79,7 +80,7 @@ def redact_text(text: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text or "")]
+    return textutil.tokens(text)
 
 
 @dataclass
@@ -136,7 +137,7 @@ class CorpusIndex:
             start = parse_dt(m["start"])
             for s in m.get("segments", []):
                 who = s.get("speaker_name") or s.get("speaker_label") or "Unknown speaker"
-                dt = start + __import__("datetime").timedelta(seconds=float(s.get("end_s", 0)))
+                dt = start + timedelta(seconds=float(s.get("end_s", 0)))
                 text = (
                     f"[{m['title']}, {m['start'][:10]}] "
                     f"{who}: {s.get('text', '')}"
@@ -306,35 +307,66 @@ class CorpusIndex:
             ))
         return out
 
+    # ------------------------------------------------------------------
+    # Entities are derived from the data itself (directory + mined phrases);
+    # nothing here knows about any particular question or storyline.
+    # ------------------------------------------------------------------
     def entity_aliases(self) -> dict[str, set[str]]:
+        """alias-set per entity key: people, channels and recurring proper-noun phrases."""
+        if getattr(self, "_entities", None) is not None:
+            return self._entities
         aliases: dict[str, set[str]] = {}
         for u in self.users:
-            vals = {
-                str(u.get("id") or ""),
-                str(u.get("name") or ""),
-                str(u.get("real_name") or ""),
-                str(u.get("email") or ""),
-            }
-            full = (u.get("real_name") or "").lower().split()
-            if len(full) >= 2:
-                vals.add(" ".join(full))
+            if u.get("is_bot"):
+                continue
+            vals = {str(u.get(k) or "") for k in ("id", "name", "real_name", "email")}
             if u.get("email"):
                 vals.add(u["email"].split("@")[0])
             aliases[u.get("id", "")] = {v.lower() for v in vals if v}
         for c in self.channels:
-            aliases[c.get("id", "")] = {
-                str(c.get("id") or "").lower(),
-                str(c.get("name") or "").lower(),
-                "#" + str(c.get("name") or "").lower(),
-            }
-        # Common projects/customers mentioned heavily in the corpus.
-        for phrase in [
-            "route planner v2", "route-planner", "acme freight", "harbor logistics",
-            "pipelinepilot", "dark mode", "board deck prep", "postgis", "eta prototype",
-            "geocoding", "regression test plan", "nrr",
-        ]:
-            aliases[phrase] = {phrase.lower()}
+            if c.get("is_dm"):
+                continue
+            nm = str(c.get("name") or "").lower()
+            aliases[c.get("id", "")] = {nm, "#" + nm, nm.replace("-", " ")}
+        for phrase in self._mine_phrases():
+            aliases["phrase:" + phrase] = {phrase}
+        self._entities = aliases
         return aliases
+
+    _PHRASE = re.compile(r"\b[A-Z][\w&'-]*(?:[ \t]+(?:[A-Z][\w&'-]*|v\d+))+")
+    _NOT_NAME = frozenset("hi hello hey dear thanks from to cc bcc subject re fwd and but so can could should would will add update "
+                          "begin end order guests organizer when where who what why how the".split()) | set(textutil.WEEKDAYS) | \
+        {w[:3] for w in textutil.WEEKDAYS} | set(textutil.MONTHS) | {m[:3] for m in textutil.MONTHS}
+
+    def _mine_phrases(self, min_records: int = 3) -> set[str]:
+        """Recurring multi-word proper nouns (customers, projects, products)."""
+        counts: dict[str, set[str]] = {}
+        for r in self.records:
+            body = r.original_text
+            if r.source == "meeting":  # drop the "[Title, date] Speaker:" prefix
+                body = body.partition("] ")[2].partition(": ")[2]
+            elif r.source in ("slack", "chatgpt", "dictation", "calendar"):
+                body = body.partition("] ")[2]
+            for m in self._PHRASE.finditer(body):
+                words = m.group(0).split()
+                if len(words) > 4 or words[0].lower() in self._NOT_NAME or words[-1].lower() in self._NOT_NAME:
+                    continue
+                counts.setdefault(m.group(0).lower(), set()).add(r.record_id)
+        people = {n for u in self.users for n in (str(u.get("real_name") or "").lower(),) if n}
+        out = {p for p, ids in counts.items() if len(ids) >= min_records and p not in people}
+        # keep the more specific phrase when one contains another with the same support
+        return {p for p in out if not any(p != q and p in q and len(counts[q]) >= 0.8 * len(counts[p]) for q in out)}
+
+    def record_dates(self, rec: Record) -> set:
+        """Calendar days a record is about (mentioned dates + calendar start)."""
+        cache = self.__dict__.setdefault("_dates", {})
+        if rec.id not in cache:
+            d = set(textutil.dates_in(rec.original_text))
+            if rec.source == "calendar":
+                st = rec.metadata.get("start", {})
+                d |= textutil.dates_in(st.get("dateTime") or st.get("date") or "")
+            cache[rec.id] = d
+        return cache[rec.id]
 
     def record_available(self, record_id: str, as_of: datetime) -> bool:
         rec = self._by_id.get(record_id)

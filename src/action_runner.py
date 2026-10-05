@@ -1,3 +1,11 @@
+"""Dry-run action planning.
+
+A command is turned into a list of structured actions; nothing is executed. The planner is generic:
+people, channels and events are resolved from the connector data, times are parsed relative to `as_of`,
+and message content comes from the command itself (or from memory when the command refers to a fact,
+e.g. "the corrected NRR"). Destructive requests become `confirm`; unresolved or ambiguous references
+become `clarify` instead of a guess.
+"""
 from __future__ import annotations
 
 import json
@@ -6,258 +14,418 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from . import textutil
+from .contacts import Directory, Person
 from .indexer import CorpusIndex, LA, parse_dt
-from .benchmark_rules import ANSWERS, CHANNELS, EVENTS, PEOPLE
+from .timeparse import combine, parse_offset, parse_when, strip_spans
+
+ACTION_VERBS = r"(?:thank|tell|message|email|e-mail|slack|dm|ping|remind|book|schedule|set up|ask|send|open|delete|remove|move|reschedule|push|cancel|let)"
+POLITE = re.compile(r"^(?:please|hey|ok(?:ay)?|can you|could you|would you|will you|i need you to|i want you to|go ahead and)[,\s]+", re.I)
+QUESTION_START = re.compile(r"^(what|when|where|who|whom|whose|why|how|which|did|do|does|is|are|was|were|has|have|had|am|can i|could i)\b", re.I)
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
 
 
-def _local(dt: datetime) -> datetime:
-    return dt.astimezone(LA)
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(LA).isoformat()
 
 
-def _resolve_user(corpus: CorpusIndex, name: str) -> dict[str, Any] | None:
-    n = name.lower().strip()
-    # Prefer exact real/name matches, then substring matches.
-    exact = []
-    fuzzy = []
-    for u in corpus.users:
-        vals = {str(u.get("name","")).lower(), str(u.get("real_name","")).lower()}
-        if n in vals or n == str(u.get("real_name","")).lower().split()[-1]:
-            exact.append(u)
-        elif n in " ".join(vals):
-            fuzzy.append(u)
-    return (exact or fuzzy or [None])[0]
+def clarify(q: str) -> list[dict]:
+    return [{"type": "clarify", "args": {"question": q}}]
 
 
-def _resolve_email(corpus: CorpusIndex, name: str) -> str | None:
-    u = _resolve_user(corpus, name)
-    if u and u.get("email"):
-        return u["email"]
-    # External contacts appear in Gmail records; resolve by name.
-    target = name.lower().strip()
-    messages_path = corpus.data_dir / "connectors/gmail/messages.jsonl"
-    for line in messages_path.read_text().splitlines():
-        if not line.strip():
-            continue
-        x = json.loads(line)
-        addrs = [x.get("from","")] + list(x.get("to",[])) + list(x.get("cc",[]))
-        for a in addrs:
-            if target in a.lower():
-                m = re.search(r"<([^>]+)>", a)
-                return m.group(1) if m else a.strip()
-    return None
+# ----------------------------------------------------------------------------- context
+class Planner:
+    def __init__(self, data_dir: str, engine=None):
+        self.corpus = CorpusIndex(data_dir)
+        self.dir = Directory(self.corpus)
+        self.engine = engine  # optional MemoryEngine: used to resolve "the corrected NRR"-style references
 
+    # ---- lookups -------------------------------------------------------------------------
+    def find_channel(self, phrase: str) -> dict | None:
+        p = re.sub(r"[#]|\bchannel\b|\bthe\b", "", phrase.lower()).strip().replace(" ", "-")
+        for c in self.corpus.channels:
+            if not c.get("is_dm") and p in {c["name"].lower(), c["id"].lower()}:
+                return c
+        for c in self.corpus.channels:
+            if not c.get("is_dm") and p and (p in c["name"].lower() or c["name"].lower() in p):
+                return c
+        return None
 
-def _find_channel(corpus: CorpusIndex, name: str) -> dict[str, Any] | None:
-    target = name.lower().strip().lstrip("#")
-    for c in corpus.channels:
-        if target in {c.get("name","").lower().lstrip("#"), c.get("id","").lower()}:
-            return c
-    for c in corpus.channels:
-        if target in c.get("name","").lower():
-            return c
-    return None
+    def find_event(self, phrase: str, as_of: datetime) -> dict | None:
+        want = set(textutil.tokens(phrase))
+        if not want:
+            return None
+        best, best_key = None, None
+        for e in self.corpus.events.values():
+            if parse_dt(e["updated"]) > as_of or e.get("status") == "cancelled":
+                continue
+            summ = set(textutil.tokens(e.get("summary") or ""))
+            extra = set(textutil.tokens(f"{e.get('description') or ''} {e.get('location') or ''}"))
+            hit = want & summ
+            if not hit and not (want & extra):
+                continue
+            score = 2 * len(hit) / max(1, len(summ)) + len(hit) / len(want) + 0.2 * len(want & extra) / len(want)
+            st = parse_dt((e.get("start") or {}).get("dateTime") or (e.get("start") or {}).get("date"))
+            upcoming = st >= as_of
+            key = (round(score, 3), upcoming, -abs((st - as_of).total_seconds()))
+            if best_key is None or key > best_key:
+                best, best_key = e, key
+        return best
 
+    def resolve_people(self, names: list[str], via: str | None, as_of: datetime) -> tuple[list[Person], list[dict] | None]:
+        out: list[Person] = []
+        for n in names:
+            hits = self.dir.find(n, via)
+            if not hits and via:
+                hits = self.dir.find(n)  # reachable some other way
+            if not hits:
+                return [], clarify(f"I couldn't find anyone called {n.strip().title()}. Who do you mean?")
+            if len(hits) > 1:
+                opts = " or ".join(p.name for p in hits[:3])
+                return [], clarify(f"Which {n.strip().title()} do you mean: {opts}?")
+            out.append(hits[0])
+        return out, None
 
-def _find_event(corpus: CorpusIndex, phrase: str, as_of: datetime) -> dict[str, Any] | None:
-    p = phrase.lower()
-    candidates=[]
-    for e in corpus.events.values():
-        updated=parse_dt(e["updated"])
-        if updated > as_of:
-            continue
-        hay=" ".join([
-            str(e.get("id","")), str(e.get("summary","")), str(e.get("description","")),
-            str(e.get("location",""))
-        ]).lower()
-        score=sum(1 for t in re.findall(r"[a-z0-9]+", p) if t in hay)
-        if score:
-            candidates.append((score, updated, e))
-    candidates.sort(key=lambda x:(-x[0], -x[1].timestamp(), x[2]["id"]))
-    return candidates[0][2] if candidates else None
+    # ---- entry ---------------------------------------------------------------------------
+    def plan(self, command: str, as_of_str: str) -> list[dict]:
+        as_of = parse_dt(as_of_str)
+        c = POLITE.sub("", command.strip()).strip()
+        if not c:
+            return clarify("What would you like me to do?")
+        if self._is_question(c):
+            return [{"type": "memory.ask", "args": {"question": command.strip()}}]
+        clauses = self._split(c)
+        actions: list[dict] = []
+        for cl in clauses:
+            res = self._one(cl, as_of, whole=c)
+            if res and res[0]["type"] == "clarify":
+                return res  # never act on part of a command we could not fully resolve
+            actions.extend(res or [])
+        return actions or clarify("I'm not sure what action you want. Could you rephrase?")
 
+    @staticmethod
+    def _is_question(c: str) -> bool:
+        if re.match(rf"^{ACTION_VERBS}\b", c, re.I):
+            return False
+        return c.rstrip().endswith("?") or bool(QUESTION_START.match(c))
 
-def _iso_local(dt: datetime) -> str:
-    return _local(dt).isoformat()
+    def _split(self, c: str) -> list[str]:
+        """Split "A and B" into two actions only when B starts a new action: a verb that always starts
+        one, or a messaging verb aimed at someone/some channel ("thank Ben ...", not "ask if she ...")."""
+        always = r"(?:remind|book|schedule|set up|open|delete|remove|move|reschedule|push|cancel|email|e-mail|slack|dm)"
+        directed = r"(?:thank|tell|message|ping|ask|send|let|notify)"
+        pieces = re.split(r"(\s*(?:,\s*and|,|;|\band then\b|\bthen\b|\band\b)\s+)", c, flags=re.I)
+        out, cur = [], pieces[0]
+        for sep, nxt in zip(pieces[1::2], pieces[2::2]):
+            first = nxt.split(None, 2)
+            ok = False
+            if first and re.match(rf"^{always}$", first[0], re.I):
+                ok = True
+            elif first and re.match(rf"^{directed}$", first[0], re.I) and len(first) > 1:
+                target = first[1].strip(",")
+                ok = bool(self.dir.find(target)) or target.lower() == "the" and "channel" in nxt.lower() or target.startswith("#")
+            if ok:
+                out.append(cur.strip())
+                cur = nxt
+            else:
+                cur += sep + nxt
+        out.append(cur.strip())
+        return [p for p in out if p]
 
-
-def _next_named_time(as_of: datetime, date_phrase: str, time_phrase: str) -> datetime:
-    # Date phrases are relative to the as_of date in Alex's timezone.
-    base = _local(as_of)
-    if date_phrase == "tomorrow":
-        day = base.date() + timedelta(days=1)
-    elif date_phrase == "today":
-        day = base.date()
-    else:
-        m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\b", date_phrase)
+    def _one(self, c: str, as_of: datetime, whole: str) -> list[dict]:
+        low = c.lower()
+        if re.match(r"^(delete|remove|erase|wipe|trash|purge)\b", low):
+            return self._destructive(c)
+        if re.match(r"^cancel\b", low):
+            return self._cancel(c, as_of)
+        m = re.match(r"^open\s+(.+)$", c, re.I)
         if m:
-            day = base.date().replace(day=int(m.group(1)))
+            app = re.sub(r"^(?:the\s+)?|\s+app$", "", m.group(1).strip().rstrip(".!"), flags=re.I)
+            return [{"type": "app.open", "args": {"app": app}}]
+        if low.startswith("remind"):
+            return self._remind(c, as_of)
+        if re.match(r"^(book|schedule|set up|create|add|arrange|put)\b", low) and re.search(r"\b(meeting|call|time|sync|1:1|catch[- ]?up|minutes?|hour|with)\b", low):
+            return self._create_event(c, as_of)
+        if re.match(r"^(move|reschedule|push|shift|postpone)\b", low):
+            return self._update_event(c, as_of)
+        if re.match(r"^(e-?mail|mail)\b", low) or re.search(r"^send\b.*\be-?mail\b", low):
+            return self._email(c, as_of)
+        if re.match(r"^(slack|dm|message|ping|tell|thank|notify|let|ask|send)\b", low):
+            return self._slack(c, as_of)
+        return clarify(f"I'm not sure what to do with: {c}")
+
+    # ---- destructive ---------------------------------------------------------------------
+    def _destructive(self, c: str) -> list[dict]:
+        m = re.search(r"\bfrom\s+([A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+)?)", c)
+        what = re.sub(r"^\s*\w+\s+", "", c).rstrip(".!? ")
+        if m:
+            hits = self.dir.find(m.group(1))
+            if len(hits) == 1:
+                what = what.replace(m.group(1), hits[0].name)
+        verb = c.split()[0].capitalize()
+        return [{"type": "confirm", "args": {"summary": f"{verb} {what}? This can't be undone."}}]
+
+    def _cancel(self, c: str, as_of: datetime) -> list[dict]:
+        phrase = re.sub(r"^cancel\s+(?:my\s+|the\s+)?", "", c, flags=re.I)
+        ev = self.find_event(phrase, as_of)
+        if not ev:
+            return clarify(f"Which event should I cancel? I couldn't find “{phrase}”.")
+        return [{"type": "confirm", "args": {"summary": f"Cancel “{ev['summary']}” (event {ev['id']})? Attendees will be notified.",
+                                              "event_id": ev["id"]}}]
+
+    # ---- reminders -----------------------------------------------------------------------
+    def _remind(self, c: str, as_of: datetime) -> list[dict]:
+        rest = re.sub(r"^remind\s+me\s*", "", c, flags=re.I)
+        off = parse_offset(rest)
+        if off:
+            delta, phrase, m = off
+            ev = self.find_event(phrase, as_of)
+            if not ev:
+                return clarify(f"Which event do you mean by “{phrase}”?")
+            start = parse_dt(ev["start"].get("dateTime") or ev["start"]["date"] + "T09:00:00")
+            task = strip_spans(rest, [m.span()])
+            due = start + delta
         else:
-            day = base.date()
-    t = re.match(r"(?i)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", time_phrase.strip())
-    if not t:
-        raise ValueError("unparseable time")
-    hour=int(t.group(1)); minute=int(t.group(2) or 0); ap=(t.group(3) or "").lower()
-    if ap=="pm" and hour<12: hour += 12
-    if ap=="am" and hour==12: hour=0
-    if not ap and 1 <= hour <= 7: hour += 12  # workplace "at 2" => 2pm
-    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=LA)
+            w = parse_when(rest, as_of)
+            if w.day is None and w.at is None:
+                return clarify("When should I remind you?")
+            day = w.day or (as_of.astimezone(LA).date() + (timedelta(days=0) if w.at and combine(as_of.astimezone(LA).date(), w.at) > as_of else timedelta(days=1)))
+            due = combine(day, w.at or __import__("datetime").time(9, 0))
+            task = strip_spans(rest, w.spans)
+        task = re.sub(r"^(?:to|that|about)\s+", "", task.strip(), flags=re.I).strip(" ,.")
+        if not task:
+            return clarify("What should the reminder say?")
+        return [{"type": "reminder.create", "args": {"text": task, "due": _iso(due)}}]
+
+    # ---- calendar ------------------------------------------------------------------------
+    def _create_event(self, c: str, as_of: datetime) -> list[dict]:
+        w = parse_when(c, as_of)
+        if w.day is None:
+            return clarify("Which day should I schedule it?")
+        if w.at is None:
+            return clarify("What time should I schedule it?")
+        names: list[str] = []
+        m = re.search(r"\bwith\s+(.+?)(?=\s+(?:tomorrow|today|on|at|about|for|to|next|this|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d)\b|$)", c, re.I)
+        if m:
+            names = [n.strip() for n in re.split(r"\s*(?:,|\band\b)\s*", m.group(1)) if n.strip()]
+        people, bad = self.resolve_people(names, "email", as_of)
+        if bad:
+            return bad
+        topic = None
+        t = re.search(r"\b(?:about|re:?|regarding|to discuss|to talk about|to go over|to review|to cover|to walk through|for)\s+(.+)$", c, re.I)
+        if t:
+            topic = strip_spans(t.group(1), [])
+            topic = re.sub(r"\b(tomorrow|today)\b.*$", "", topic).strip(" .")
+        who = ", ".join(p.first for p in people)
+        title = f"{topic[0].upper() + topic[1:]}" if topic else (f"Meeting with {who}" if who else "Meeting")
+        if topic and who:
+            title = f"{who} / Alex: {topic}"
+        start = combine(w.day, w.at)
+        end = start + (w.duration or timedelta(minutes=60))
+        return [{"type": "calendar.create_event", "args": {
+            "title": title, "start": _iso(start), "end": _iso(end),
+            "attendees": [p.email for p in people if p.email]}}]
+
+    def _update_event(self, c: str, as_of: datetime) -> list[dict]:
+        m = re.match(r"^(?:move|reschedule|push|shift|postpone)\s+(?:my\s+|the\s+)?(?P<ev>.+?)\s+(?:to|until|till|for)\s+(?P<when>.+)$", c, re.I)
+        shift = re.match(r"^(?:move|push|shift|postpone)\s+(?:my\s+|the\s+)?(?P<ev>.+?)\s+(?:back|forward|ahead|later|earlier|by)\s+(?:by\s+)?(?P<n>\d+|an?|one|two|half an?)\s*(?P<u>hours?|minutes?|mins?|days?)\b", c, re.I)
+        if shift:
+            ev = self.find_event(shift.group("ev"), as_of)
+            if not ev:
+                return clarify(f"Which event do you mean by “{shift.group('ev')}”?")
+            raw = shift.group("n").lower()
+            n = 0.5 if raw.startswith("half") else (int(raw) if raw.isdigit() else {"a": 1, "an": 1, "one": 1, "two": 2}[raw])
+            unit = shift.group("u").lower()
+            d = timedelta(days=n) if unit.startswith("d") else timedelta(hours=n) if unit.startswith("h") else timedelta(minutes=n)
+            if re.search(r"\b(earlier|ahead)\b", c, re.I):
+                d = -d
+            st, en = parse_dt(ev["start"]["dateTime"]), parse_dt(ev["end"]["dateTime"])
+            return [{"type": "calendar.update_event", "args": {"event_id": ev["id"], "start": _iso(st + d), "end": _iso(en + d)}}]
+        if not m:
+            return clarify("What should I move, and to when?")
+        ev = self.find_event(m.group("ev"), as_of)
+        if not ev:
+            return clarify(f"Which event do you mean by “{m.group('ev')}”?")
+        w = parse_when(m.group("when"), as_of)
+        if w.day is None and w.at is None:
+            return clarify("What new day or time should I use?")
+        st, en = parse_dt(ev["start"]["dateTime"]).astimezone(LA), parse_dt(ev["end"]["dateTime"]).astimezone(LA)
+        new = combine(w.day or st.date(), w.at or st.timetz().replace(tzinfo=None))
+        return [{"type": "calendar.update_event", "args": {"event_id": ev["id"], "start": _iso(new), "end": _iso(new + (en - st))}}]
+
+    # ---- messaging -----------------------------------------------------------------------
+    def _take_recipients(self, text: str, via: str | None, as_of: datetime):
+        """Longest-prefix match of known people at the start of `text` ('Sarah Patel and ...', 'John the ...')."""
+        toks = text.split()
+        names, i = [], 0
+        while i < len(toks):
+            for span in (2, 1):
+                cand = " ".join(toks[i:i + span]).strip(",")
+                if cand and self.dir.find(cand, via if via else None) and (span == 1 or len(cand.split()) == 2):
+                    # a two-word candidate must be a real full-name hit, not first-name + next word
+                    if span == 2 and not any(cand.lower() == p.name.lower() for p in self.dir.people):
+                        continue
+                    names.append(cand)
+                    i += span
+                    break
+            else:
+                break
+            if i < len(toks) and toks[i].lower() == "and" and i + 1 < len(toks) and self.dir.find(toks[i + 1].strip(","), via):
+                i += 1
+                continue
+            break
+        return names, " ".join(toks[i:])
+
+    def _compose(self, payload: str, recipient: Person | None, as_of: datetime) -> str:
+        p = payload.strip().rstrip(".")
+        p = re.sub(r"^(?:and\s+)?", "", p, flags=re.I)
+        m = re.match(r"^(?:ask|check)\s+(?:him|her|them)?\s*(?:if|whether)\s+(.*)$", p, re.I)
+        if m:
+            return _question_to_you(m.group(1))
+        m = re.match(r"^ask\s+(?:him|her|them)?\s*(?:about|for)\s+(.*)$", p, re.I)
+        if m:
+            return f"Could you share {m.group(1)}?"
+        m = re.match(r"^(?:tell|let)\s+(?:him|her|them)?\s*(?:know\s+)?(?:that\s+)?(.*)$", p, re.I)
+        if m:
+            p = m.group(1)
+        p = re.sub(r"^(?:that|to say|saying)\s+", "", p, flags=re.I)
+        m = re.match(r"^thank(?:\s+(?:you|\w+))?(?:\s+for\s+(.*))?$", p, re.I)
+        if m:
+            return f"Thanks{' for ' + m.group(1) if m.group(1) else ''}!"
+        if re.match(r"^(?:the|our|my|a|an)\s+[\w\s'-]{2,40}$", p, re.I) and self.engine is not None:
+            fact = self._lookup_fact(p, as_of)
+            if fact:
+                return f"{p[0].upper() + p[1:]}: {fact}"
+        return (p[0].upper() + p[1:] + ".") if p else ""
+
+    def _lookup_fact(self, phrase: str, as_of: datetime) -> str | None:
+        """Resolve a noun phrase ('the corrected NRR') to its current value using memory: among sentences that
+        mention the topic and carry a value, prefer correction wording when the phrase asks for it,
+        otherwise the most recent one."""
+        eng = self.engine
+        q = re.sub(r"^(?:the|our|my)\s+", "", phrase, flags=re.I)
+        wants_fix = bool(re.search(r"\b(corrected|updated|latest|current|new|final|fixed)\b", q, re.I))
+        topic = re.sub(r"\b(?:corrected|updated|latest|current|new|final|fixed)\b\s*", "", q, flags=re.I).strip()
+        terms = set(textutil.tokens(topic))
+        hits = eng.retriever.search(f"{topic}", as_of.isoformat(), 20)
+        cue = re.compile(r"\b(not|fix(?:ed)?|correct(?:ed|ion)?|actually|now|update[sd]?|instead|after)\b", re.I)
+        cands = []
+        for h in hits:
+            body = h.record.text.partition("] ")[2] or h.record.text
+            body = re.sub(r"^[A-Z][\w .'-]{1,30}:\s+", "", body)  # drop the "Speaker:" prefix
+            for sent in textutil.split_sentences(body):
+                if terms and terms <= set(textutil.tokens(sent)) and textutil.values_in(sent) | set(re.findall(r"\b\d+\b", sent)):
+                    cands.append((bool(cue.search(sent)) if wants_fix else True, h.record.delivery_time, sent))
+        if not cands:
+            return None
+        best = max(cands, key=lambda c: (c[0], c[1]))[2]
+        words = best.split()
+        return " ".join(words[:30]).rstrip(" ,;") + ("" if best.endswith(".") else ".")
+
+    def _subject_for(self, person: Person, payload: str) -> str:
+        want = {t for t in textutil.tokens(payload) if len(t) > 3}
+        best = None
+        gm = self.corpus.data_dir / "connectors/gmail/messages.jsonl"
+        for line in gm.read_text().splitlines():
+            if not line.strip():
+                continue
+            m = json.loads(line)
+            addrs = " ".join([m.get("from", "")] + list(m.get("to", [])) + list(m.get("cc", []))).lower()
+            if person.email and person.email.lower() in addrs and want & set(textutil.tokens(m.get("subject", ""))):
+                best = m
+        if best:
+            return "Re: " + re.sub(r"^(?:re:\s*)+", "", best["subject"], flags=re.I)
+        words = [w for w in re.findall(r"[\w'-]+", payload) if w.lower() not in textutil.STOP][:5]
+        return " ".join(words).capitalize() or "Following up"
+
+    def _email(self, c: str, as_of: datetime) -> list[dict]:
+        rest = re.sub(r"^(?:send\s+(?:an?\s+)?)?(?:e-?mail|mail)\s*(?:to\s+)?", "", c, flags=re.I)
+        names, payload = self._take_recipients(rest, "email", as_of)
+        if not names:
+            m = re.match(r"^([A-Za-z.'-]+)", rest)
+            return clarify(f"Who should I email{' (' + m.group(1) + ')' if m else ''}? I couldn't find that person.")
+        people, bad = self.resolve_people(names, "email", as_of)
+        if bad:
+            return bad
+        body_core = self._compose(payload, people[0], as_of)
+        if not body_core:
+            return clarify("What should the email say?")
+        greet = ", ".join(p.first for p in people)
+        me = self.dir.me.first if self.dir.me else ""
+        body = f"Hi {greet},\n\n{body_core}\n\nThanks,\n{me}".strip()
+        return [{"type": "gmail.send", "args": {
+            "to": [p.email for p in people], "cc": [],
+            "subject": self._subject_for(people[0], payload or body_core), "body": body}}]
+
+    def _slack(self, c: str, as_of: datetime) -> list[dict]:
+        explicit_email = bool(re.search(r"\b(by\s+)?e-?mail\b", c, re.I))
+        ch = re.search(r"\b(?:the\s+)?(#?[\w-]+(?:\s+[\w-]+)?)\s+channel\b|(#[\w-]+)", c, re.I)
+        if ch and not re.search(r"\bon\s+slack\b", c, re.I) or (ch and ch.group(2)):
+            chan = self.find_channel(ch.group(2) or ch.group(1))
+            if chan:
+                payload = re.sub(r"^.*?\bchannel\b\s*", "", c, flags=re.I) if ch.group(1) else re.sub(r"^.*?#[\w-]+\s*", "", c)
+                text = self._compose(payload, None, as_of)
+                return [{"type": "slack.send_message", "args": {"to": chan["id"], "text": text}}] if text else clarify("What should I post?")
+        m = re.match(r"^(?:slack|dm|message|ping|tell|thank|notify|let|ask|send)\s+(?P<rest>.+)$", c, re.I)
+        verb = c.split()[0].lower()
+        rest = m.group("rest") if m else c
+        rest = re.sub(r"^(?:a\s+)?(?:message|dm)\s+to\s+", "", rest, flags=re.I)
+        names, payload = self._take_recipients(rest, None, as_of)
+        if not names:
+            return clarify("Who should I message?")
+        via = "slack" if re.search(r"\bslack\b|\bdm\b", c, re.I) or verb in ("slack", "dm") else ("email" if explicit_email else None)
+        payload = re.sub(r"^(?:on|via|in)\s+slack\s*", "", payload, flags=re.I)
+        people, bad = self.resolve_people(names, via, as_of)
+        if bad:
+            return bad
+        if verb == "thank":
+            fm = re.search(r"\bfor\s+(.+)$", payload, re.I)
+            text = f"Thanks {people[0].first}{' for ' + fm.group(1).rstrip('.') if fm else ''}!"
+        else:
+            p = payload
+            if verb in ("ask",):
+                p = "ask " + p
+            text = self._compose(p if p else "", people[0], as_of)
+            if re.match(r"^about\s", payload, re.I):
+                text = f"Hi {people[0].first}, quick note {payload.strip().rstrip('.')}."
+        if not text:
+            return clarify("What should the message say?")
+        person = people[0]
+        if via == "email" or (not person.slack_id and person.email):
+            return [{"type": "gmail.send", "args": {"to": [person.email], "cc": [], "subject": self._subject_for(person, payload), "body": f"Hi {person.first},\n\n{text}"}}]
+        return [{"type": "slack.send_message", "args": {"to": person.slack_id, "text": text}}]
 
 
-def predict_action(corpus: CorpusIndex, command: str, as_of_str: str) -> list[dict[str, Any]]:
-    c = command.strip()
-    q = c.lower()
-    as_of = parse_dt(as_of_str)
-    local = _local(as_of)
-
-    # Explicit multi-action commands are parsed before generic Slack/email branches.
-    if re.search(r"\bemail\s+john\b", q) and "thank ben on slack" in q:
-        return [
-            {"type":"gmail.send","args":{
-                "to":[_resolve_email(corpus, PEOPLE["john"]["name"]) or PEOPLE["john"]["email"]],
-                "cc":[],"subject":"Corrected NRR","body":ANSWERS["nrr"]
-            }},
-            {"type":"slack.send_message","args":{
-                "to":(_resolve_user(corpus, PEOPLE["ben"]["name"]) or {"id":PEOPLE["ben"]["slack_id"]})["id"],
-                "text":ANSWERS["ben_thanks"]
-            }},
-        ]
-
-    # Destructive actions require confirmation.
-    if re.search(r"\bdelete\b.*\b(?:all|every)\b.*\bemails?\b", q):
-        subject = re.sub(r"^\s*delete\s+", "Delete ", c, flags=re.I)
-        return [{"type":"confirm","args":{"summary":subject.rstrip(".?")+"? This can't be undone."}}]
-
-    # Open apps.
-    m = re.match(r"open\s+(.+)$", c, re.I)
+def _question_to_you(clause: str) -> str:
+    cl = clause.strip().rstrip(".?")
+    m = re.match(r"^(?:he|she|they)(?:'s|\s+has|\s+have|'ve)\s+(going\s+.*)$", cl, re.I)
     if m:
-        return [{"type":"app.open","args":{"app":m.group(1).strip()}}]
-
-    # Memory questions.
-    if re.match(r"^(what|when|where|who|why|how|did|is|are|has|have|what's|whats)\b", q) and (
-        "launch date" in q or "launch" in q or "memory" in q
-    ):
-        return [{"type":"memory.ask","args":{"question":c}}]
-
-    # Ambiguous Sarah, but only when the user has not already specified Slack.
-    if re.search(r"\bmessage\s+sarah\b", q) and "sarah patel" not in q and "sarah kim" not in q and "slack" not in q:
-        return [{"type":"clarify","args":{"question":"Which Sarah do you mean: Sarah Patel or Sarah Kim?"}}]
-
-    # Slack sends.
-    if ("slack" in q or re.search(r"\bmessage\b", q) or re.search(r"\btell\b", q)) and (
-        "slack" in q or "channel" in q or "message" in q
-    ):
-        text = c
-        to = None
-        if "route planner channel" in q:
-            ch = _find_channel(corpus, "route-planner")
-            to = ch["id"] if ch else CHANNELS["route_planner"]
-            text = re.sub(r"(?i)^tell the route planner channel (?:that )?", "", c).strip()
-        elif re.search(r"message\s+sarah\s+on\s+slack", q):
-            # The only Slack Sarah is Sarah Kim.
-            u = _resolve_user(corpus, PEOPLE["sarah_kim"]["name"])
-            to = u["id"] if u else PEOPLE["sarah_kim"]["slack_id"]
-            text = re.sub(r"(?i)^message\s+sarah\s+on\s+slack\s+(?:that\s+)?", "", c).strip()
-        elif re.search(r"thank\s+ben\s+on\s+slack", q):
-            u = _resolve_user(corpus, PEOPLE["ben"]["name"])
-            to = u["id"] if u else PEOPLE["ben"]["slack_id"]
-            text = ANSWERS["ben_thanks"]
-        if to:
-            # Preserve semantic payload, stripping leading instruction words.
-            if text.lower().startswith(("the geocoding fix looks good", "geocoding fix looks good")):
-                text = "The geocoding fix looks good."
-            if "thank ben" in q:
-                text = ANSWERS["ben_thanks"]
-            if "launching october 21" in q or "october 21" in q:
-                text = ANSWERS["launch"]
-            return [{"type":"slack.send_message","args":{"to":to,"text":text}}]
-
-    # Email send.
-    if re.match(r"^email\s+", q) or re.search(r"\bsend\b.*\bemail\b", q):
-        if "sarah patel" in q:
-            to=_resolve_email(corpus, PEOPLE["sarah_patel"]["name"]) or PEOPLE["sarah_patel"]["email"]
-        elif re.search(r"\bjohn\b", q):
-            to=_resolve_email(corpus, PEOPLE["john"]["name"]) or PEOPLE["john"]["email"]
-        else:
-            to=None
-        if to:
-            body=c
-            if "chance to look" in q:
-                body="Have you had a chance to look at the proposal?"
-            if "corrected nrr" in q:
-                body=ANSWERS["nrr"]
-            subj="".join([s.strip().title() + " " for s in []]).strip()
-            return [{"type":"gmail.send","args":{"to":[to],"cc":[],"subject":"Re: follow-up","body":body}}]
-
-    # Calendar update.
-    if re.search(r"\bmove\b", q) and "board deck prep" in q:
-        event=corpus.events.get(EVENTS["board_prep"])
-        if event:
-            start=parse_dt(event["start"]["dateTime"])
-            m=re.search(r"\bto\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", q)
-            if m:
-                hour=int(m.group(1)); minute=int(m.group(2) or 0); ap=(m.group(3) or "").lower()
-                if ap=="pm" and hour<12: hour+=12
-                if ap=="am" and hour==12: hour=0
-                new_start=start.astimezone(LA).replace(hour=hour,minute=minute,second=0,microsecond=0)
-                duration=parse_dt(event["end"]["dateTime"])-start
-                new_end=new_start+duration
-                return [{"type":"calendar.update_event","args":{
-                    "event_id":event["id"],"start":_iso_local(new_start),"end":_iso_local(new_end)
-                }}]
-
-    # Calendar creation.
-    if q.startswith("book "):
-        dur_minutes=30 if "30 minutes" in q else 60
-        m=re.search(r"\bwith\s+([A-Za-z]+)(?:\s+tomorrow)?\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", q)
-        if m:
-            who=m.group(1)
-            dt=_next_named_time(as_of,"tomorrow",""+m.group(2))
-            user=_resolve_user(corpus, who)
-            email=(user or {}).get("email") or _resolve_email(corpus, who)
-            title=c
-            return [{"type":"calendar.create_event","args":{
-                "title":"Discussion: NRR fix",
-                "start":_iso_local(dt),
-                "end":_iso_local(dt+timedelta(minutes=dur_minutes)),
-                "attendees":[email] if email else []
-            }}]
-
-    # Reminders.
-    if q.startswith("remind me"):
-        if "hour before" in q and "board meeting" in q:
-            event=corpus.events.get(EVENTS["board"])
-            if not event or parse_dt(event["updated"]) > as_of:
-                event=_find_event(corpus,"board meeting",as_of)
-            if event:
-                start=parse_dt(event["start"]["dateTime"])
-                due=start-timedelta(hours=1)
-                m=re.search(r"to\s+(.+)$", c, re.I)
-                text=m.group(1).strip() if m else c
-                return [{"type":"reminder.create","args":{"text":text,"due":_iso_local(due)}}]
-        m=re.search(r"on the\s+(\d{1,2})(?:st|nd|rd|th)?\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", q)
-        if m:
-            due=_next_named_time(as_of,m.group(1),m.group(2))
-            return [{"type":"reminder.create","args":{"text":c.split("at")[0].replace("Remind me to","").strip(),"due":_iso_local(due)}}]
-
-    # Default: treat plain questions as memory queries.
-    if q.endswith("?") or q.startswith(("what ","when ","who ","why ","how ")):
-        return [{"type":"memory.ask","args":{"question":c}}]
-
-    return [{"type":"clarify","args":{"question":"What action would you like me to take?"}}]
+        return f"Are you {m.group(1)}?"
+    m = re.match(r"^(?:he|she|they)(?:'s|\s+has|\s+have|'ve)\s+(.*)$", cl, re.I)
+    if m:
+        return f"Have you {m.group(1)}?"
+    m = re.match(r"^(?:he|she|they)\s+(can|could|will|would|should|did|does|do)\s+(.*)$", cl, re.I)
+    if m:
+        return f"{m.group(1).capitalize()} you {m.group(2)}?"
+    m = re.match(r"^(?:he|she|they)\s+(?:is|are|was|were)\s+(.*)$", cl, re.I)
+    if m:
+        return f"Are you {m.group(1)}?"
+    cl = re.sub(r"\b(?:he|she|they)\b", "you", cl, flags=re.I)
+    return f"Could you confirm whether {cl}?"
 
 
 def run_actions(input_path: str, output_path: str, data_dir: str) -> None:
-    corpus=CorpusIndex(data_dir)
-    rows=load_jsonl(input_path)
-    out=Path(output_path); out.parent.mkdir(parents=True,exist_ok=True)
+    from .memory_runner import MemoryEngine
+    engine = MemoryEngine(data_dir, use_llm=False)
+    planner = Planner(data_dir, engine)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w") as f:
-        for item in rows:
-            pred=predict_action(corpus,item["command"],item["as_of"])
-            f.write(json.dumps({"id":item["id"],"actions":pred},ensure_ascii=False)+"\n")
+        for item in load_jsonl(input_path):
+            f.write(json.dumps({"id": item["id"], "actions": planner.plan(item["command"], item["as_of"])}, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
