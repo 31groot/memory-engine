@@ -19,7 +19,7 @@ from .contacts import Directory, Person
 from .indexer import CorpusIndex, LA, parse_dt
 from .timeparse import combine, parse_offset, parse_when, strip_spans
 
-ACTION_VERBS = r"(?:thank|tell|message|email|e-mail|slack|dm|ping|remind|book|schedule|set up|ask|send|open|delete|remove|move|reschedule|push|cancel|let)"
+ACTION_VERBS = r"(?:thank|tell|message|email|e-mail|slack|dm|ping|remind|book|block|schedule|set up|set|create|add|arrange|reserve|ask|send|open|launch|delete|remove|move|reschedule|push|shift|postpone|cancel|let|notify)"
 POLITE = re.compile(r"^(?:please|hey|ok(?:ay)?|can you|could you|would you|will you|i need you to|i want you to|go ahead and)[,\s]+", re.I)
 QUESTION_START = re.compile(r"^(what|when|where|who|whom|whose|why|how|which|did|do|does|is|are|was|were|has|have|had|am|can i|could i)\b", re.I)
 
@@ -141,13 +141,16 @@ class Planner:
             return self._destructive(c)
         if re.match(r"^cancel\b", low):
             return self._cancel(c, as_of)
-        m = re.match(r"^open\s+(.+)$", c, re.I)
+        m = re.match(r"^(?:open|launch|start up|bring up)\s+(.+)$", c, re.I)
         if m:
             app = re.sub(r"^(?:the\s+)?|\s+app$", "", m.group(1).strip().rstrip(".!"), flags=re.I)
             return [{"type": "app.open", "args": {"app": app}}]
         if low.startswith("remind"):
             return self._remind(c, as_of)
-        if re.match(r"^(book|schedule|set up|create|add|arrange|put)\b", low) and re.search(r"\b(meeting|call|time|sync|1:1|catch[- ]?up|minutes?|hour|with)\b", low):
+        rm = re.match(r"^(?:set|create|add|make|put)\s+(?:me\s+)?(?:up\s+)?(?:an?\s+)?reminder\s*(?:for|to|about|that)?\s*(.*)$", c, re.I)
+        if rm:
+            return self._remind("remind me " + rm.group(1), as_of)
+        if re.match(r"^(book|block|reserve|hold|schedule|set up|create|add|arrange|put)\b", low) and re.search(r"\b(meeting|call|time|sync|1:1|catch[- ]?up|minutes?|hour|with)\b", low):
             return self._create_event(c, as_of)
         if re.match(r"^(move|reschedule|push|shift|postpone)\b", low):
             return self._update_event(c, as_of)

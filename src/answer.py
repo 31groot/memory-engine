@@ -57,24 +57,78 @@ def describe_event(ev: dict) -> str:
     return f"{summary} ({when}{tail}){status}."
 
 
-def _units(text: str) -> list[tuple[str, bool]]:
-    """(sentence, is_bullet) pairs; bullets stay attached to the sentence that introduces them."""
+def _units(text: str, blocks: bool = False) -> list[tuple[str, bool]]:
+    """(sentence, is_bullet) pairs. Bullets stay attached to the sentence that introduces them, and runs of
+    label-style lines without sentence punctuation (an itinerary, a form) form one block."""
     out: list[tuple[str, bool]] = []
-    for line in re.split(r"\n+", (text or "").strip()):
-        bullet = bool(re.match(r"\s*[-•*]\s+", line))
-        line = line.strip(" -•*|")
+    block: list[str] = []
+
+    def flush() -> None:
+        if len(block) >= 3:
+            out.append((". ".join(block).replace(":.", ":"), False))
+        else:
+            out.extend((b, False) for b in block)
+        block.clear()
+
+    for raw in (text or "").strip().split("\n"):
+        bullet = bool(re.match(r"\s*[-•*]\s+", raw))
+        line = raw.strip(" -•*|")
         if not line:
+            flush()
             continue
         if bullet:
+            flush()
             out.append((line, True))
+        elif blocks and not re.search(r"[.!?:]$", line) and len(line.split()) <= 12 and not re.search(r"[.!?]\s+[A-Z]", line):
+            block.append(line)  # label-style line
         else:
+            flush()
             out.extend((p.strip(), False) for p in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\[\"'(])", line) if p.strip())
+    flush()
     return out
+
+
+SPEAKER = re.compile(r"^\s*([A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,3}):\s")
+ATTRIBUTION_Q = re.compile(r"\b(who|whom|agree[ds]?|said|say|told|tell|promis\w*|own(?:s|ed)?|assign\w*|respons\w*|"
+                           r"ask(?:ed)?|think|thinks|want(?:s|ed)?|decid\w*|approv\w*|disagree\w*)\b", re.I)
+
+
+def speaker_of(rec: Record) -> str | None:
+    """Who said it, for sources that have a speaker (meeting segments, Slack messages)."""
+    if rec.source not in ("meeting", "slack"):
+        return None
+    body = rec.text.partition("] ")[2]
+    m = SPEAKER.match(body)
+    return m.group(1) if m else None
+
+
+_FROM = re.compile(r"\bFrom\s+([^<|]+?)\s*<([^>@\s]+)@([^>\s]+)>")
+OWN_DOMAIN = "brightline"
+
+
+def author_of(rec: Record) -> tuple[str | None, str | None]:
+    """(name, organisation) of whoever wrote the record, when the source says."""
+    who = speaker_of(rec)
+    if who:
+        return who, None
+    if rec.source == "gmail":
+        m = _FROM.search(rec.text)
+        if m:
+            org = m.group(3).split(".")[0]
+            return m.group(1).strip(), (None if org == OWN_DOMAIN or org in {"google", "linear", "github"} else org)
+    return None, None
+
+
+def _person_by_email(retriever: HybridRetriever, email: str | None) -> str | None:
+    for u in retriever.corpus.users:
+        if email and (u.get("email") or "").lower() == email.lower():
+            return u.get("real_name") or u.get("name")
+    return None
 
 
 def clean_record_text(rec: Record) -> str:
     """Strip quoted email history, headers and calendar boilerplate so sentences are about this record."""
-    t = rec.text
+    t = re.sub(r"\n?\(raw transcript:.*?\)\s*$", "", rec.text, flags=re.S)
     if rec.source == "meeting":
         t = t.partition("] ")[2] or t
     elif rec.source == "gmail":
@@ -82,12 +136,34 @@ def clean_record_text(rec: Record) -> str:
         subj = head.rpartition("| ")[2]
         body = re.split(r"\n\s*On .{5,80}wrote:\s*\n", body)[0]
         body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith(">"))
+        body = "\n".join(ln for ln in body.splitlines()
+                         if not re.match(r"^\s*(?:hi|hello|hey|dear|best|thanks|thank you|regards|cheers|sincerely)\b[^.!?]{0,40},?\s*$", ln, re.I)
+                         and not re.match(r"^\s*[A-Z][a-z]+\s*$", ln))
         t = f"{subj}. {body}" if subj else body
     elif rec.source == "calendar":
         t = describe_event(rec.metadata)
     else:
         t = re.sub(r"^\[[^\]]*\]\s*", "", t)
     return re.sub(r"[ \t]+", " ", t).strip()
+
+
+_CORRECTION = re.compile(r"(?:\bsorry\b|\bscratch that\b|\bcorrection\b|\bi meant\b|\bi misspoke\b|\bmisread\b|\blet me correct\b)[^,.;]*[,.;:—-]+\s*", re.I)
+
+
+def after_correction(sent: str) -> str:
+    """'X is 800 — sorry, I misread that, X is 1.8 seconds, 800 is the median' -> 'X is 1.8 seconds.'
+    The speaker withdrew the first value, so it (and later clauses that repeat it) are not the answer."""
+    ms = list(_CORRECTION.finditer(sent))
+    if not ms:
+        return sent
+    before, after = sent[: ms[-1].start()], sent[ms[-1].end():]
+    old_vals = set(re.findall(r"(?<![A-Za-z\d.])\d+(?:\.\d+)?", before))
+    if not old_vals or not after.strip():
+        return sent
+    nums = lambda t: set(re.findall(r"(?<![A-Za-z\d.])\d+(?:\.\d+)?", t))
+    clauses = [c for c in re.split(r",\s+", after.strip()) if not (old_vals & nums(c))]
+    kept = ", ".join(clauses).strip() or after.strip()
+    return kept[0].upper() + kept[1:] if kept else sent
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -108,6 +184,8 @@ def qtype(question: str) -> str:
     q = question.lower().strip()
     if re.search(r"\bhow many days\b", q):
         return "duration"
+    if re.match(r"^where\b", q):
+        return "where"
     if re.match(r"^(did|do|does|is|are|was|were|has|have|can|could|will|would|should)\b", q):
         return "yesno"
     if re.search(r"\bhow much\b|\bsalary\b|\b(?:price|cost|quote)\b", q):
@@ -116,7 +194,7 @@ def qtype(question: str) -> str:
         return "count"
     if re.search(r"\bphone\b|\bcell\b|\bnumber for\b", q):
         return "phone"
-    if re.search(r"\bwhen\b|\bwhat (?:day|date|time)\b|\bwhat's on\b|\bwhat is on\b", q):
+    if re.search(r"\bwhen\b|\b(?:date|day|time|deadline)\b|\bwhat's on\b|\bwhat is on\b", q):
         return "when"
     if re.search(r"^\s*why\b|\bwhy\b|\bhow come\b", q):
         return "why"
@@ -131,6 +209,7 @@ _MONEY = re.compile(r"\$\s?\d|\b\d[\d,]*(?:\.\d+)?\s?(?:k|m|usd|dollars|percent|
 _PHONE = re.compile(r"(?:\+?\d[\d\s().-]{6,}\d)")
 _NUMBER = re.compile(r"\b\d+(?:\.\d+)?\b")
 _WHEN = re.compile(rf"\b(?:{'|'.join(textutil.WEEKDAYS)})\b|\b(?:{'|'.join(textutil.MONTHS)}|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b|\b\d{{1,2}}(?::\d{{2}})?\s?(?:am|pm)\b|\b\d{{1,2}}/\d{{1,2}}\b|\btomorrow\b|\btoday\b", re.I)
+_WHERE = re.compile(r"\b\d{1,5}\s+[A-Z]\w+(?:\s+\w+)?\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Way)\b|\bat\s+[A-Z][\w']+|\b(?:office|room|HQ|zoom|google meet|location)\b", re.I)
 _WHY = re.compile(r"\b(because|reason|due to|so that|since|caused|found|blocked|need(?:s|ed)?)\b", re.I)
 
 
@@ -165,7 +244,11 @@ def supported(question: str, hits: list[ScoredRecord], retriever: HybridRetrieve
     if not terms:
         return True, ""
     missing = [t for t in dict.fromkeys(terms) if bm.df(t) == 0]
-    if missing and len(missing) / len(set(terms)) >= 0.25:
+    # A missing everyday word ("held" for "hold") is usually just a different wording; a missing name,
+    # number or product is a real gap. Abstain on the latter, or when most of the question is missing.
+    named = {textutil.stem(w.lower()) for w in re.findall(r"(?<!^)(?<![.!?]\s)\b[A-Z][\w-]+|\b\w*\d\w*\b", question)}
+    missing_hard = [t for t in missing if t in named]
+    if missing and (missing_hard or len(missing) / len(set(terms)) >= 0.5):
         return False, "question mentions terms that never occur in memory: " + ", ".join(missing[:3])
 
     qt = qtype(question)
@@ -225,31 +308,65 @@ def extractive_answer(question: str, as_of: str, hits: list[ScoredRecord], retri
     qt = qtype(question)
     wants_number = bool(re.search(r"\bpric\w*|\bcost\w*|\bhow much\b", question.lower()))
     current = bool(CURRENT_CUES.search(question)) and not HISTORY_CUES.search(question) and qt != "why"
+    status = qt == "yesno" and not HISTORY_CUES.search(question)  # the latest statement decides yes/no
     pool = hits[:8]
     top = pool[0].score or 1.0
     times = sorted({h.record.delivery_time for h in pool})
     t_rank = {t: (i + 1) / len(times) for i, t in enumerate(times)}
 
+    qdates = textutil.dates_in(question)
+    cal_intent = qt == "when" or bool(CAL_LIST.search(question)) or bool(re.search(r"\b(calendar|invite|meeting|event|appointment|scheduled|where|location)\b", question, re.I))
+    attribute = qt in ("who", "yesno") or bool(ATTRIBUTION_Q.search(question))
+    q_low = question.lower()
+    SAID = r"(?:say|said|says|tell|tells|write|wrote|ask|asked|reply|replied|respond\w*|mention\w*)"
     cands = []
     for rank, h in enumerate(pool):
-        units = _units(clean_record_text(h.record))
+        if h.record.source == "calendar" and h.record.metadata.get("status") == "cancelled" and not re.search(r"cancel", question, re.I):
+            continue  # a cancelled event is not evidence about what is happening
+        text_h = clean_record_text(h.record)
+        if h.record.source == "calendar" and re.search(r"\bwho\b|organi[sz]|invit|set (?:it )?up|scheduled by", question, re.I):
+            org = _person_by_email(retriever, h.record.metadata.get("organizer"))
+            if org:  # keep it inside the event's own sentence so it is selected together with the time
+                text_h = re.sub(r"\)(\s*\[cancelled\])?\.\s*$", lambda m: f", organized by {org}){m.group(1) or ''}.", text_h)
+        units = _units(text_h, blocks=h.record.source == "gmail")
+        subject = set()
+        if h.record.source == "gmail":  # a short reply inherits what its thread is about
+            subject = set(textutil.tokens(units[0][0])) if units else set()
+        rec_dates = retriever.corpus.record_dates(h.record) | {h.record.delivery_time.astimezone(LA).date()}
+        header: set = set()
         for k, (sent, bullet) in enumerate(units):
             if len(sent.split()) < 3 and not bullet:
                 continue
             stems = set(textutil.tokens(sent))
-            cov = min(1.0, sum(idf[t] for t in idf if t in stems) / total)
+            if not bullet:
+                header = stems  # list items below it belong to this sentence
+            ctx = (header if bullet else set()) | (subject if k > 0 else set())
+            direct = sum(idf[t] for t in idf if t in stems)
+            inherited = sum(idf[t] for t in idf if t in ctx and t not in stems)
+            cov = min(1.0, (direct + 0.6 * inherited) / total)
             if cov == 0:
                 continue
             score = cov + 0.35 * (h.score / top)
+            if qdates and rec_dates & qdates:
+                score += 0.4  # "on Sep 16": records about that day
             if h.record.source == "gmail" and k == 0:
                 score *= 0.7  # the subject line is metadata, not the answer
+            if h.record.source == "calendar" and not cal_intent:
+                score *= 0.5  # event summaries are metadata unless the question is about the calendar
+            a_name, _ = author_of(h.record)
+            if a_name and re.search(rf"{re.escape(a_name.lower())}\s+(?:\w+\s+)?{SAID}\b", q_low):
+                score += 0.5  # "what did Sarah Patel say ...": her own words, not others talking about her
             if qt == "when" and _WHEN.search(sent):
                 score += 0.25
+                if textutil.DATE_MD.search(sent):
+                    score += 0.3  # an absolute date beats "Fri 10am"
+            if qt == "where" and _WHERE.search(sent):
+                score += 0.3
             if (qt in ("money", "count", "duration") or wants_number) and (_MONEY.search(sent) or _NUMBER.search(sent)):
                 score += 0.25
             if qt == "why" and _WHY.search(sent):
                 score += 0.3
-            if current:
+            if current or status:
                 score += 0.6 * t_rank[h.record.delivery_time]
             cands.append((score, sent, h, stems, k, units))
     if not cands:
@@ -264,6 +381,9 @@ def extractive_answer(question: str, as_of: str, hits: list[ScoredRecord], retri
     for c in cands:
         score, sent, h, stems = c[:4]
         gain = sum(idf[t] for t in own if t in idf and t in stems and t not in covered) / total
+        a_name = author_of(h.record)[0]
+        if attribute and a_name and a_name not in {author_of(x[2].record)[0] for x in chosen}:
+            gain += 0.1  # a different person's statement is a different perspective
         if chosen and (gain < 0.08 or any(_jaccard(stems, x[3]) > 0.6 for x in chosen)):
             continue
         chosen.append(c)
@@ -277,10 +397,17 @@ def extractive_answer(question: str, as_of: str, hits: list[ScoredRecord], retri
         def key_stems(st):
             return {x for x in st if not x.isdigit() and x not in textutil.MONTH_NUM}
         keep = []
+        typed = {"when": _WHEN, "money": _MONEY, "count": _NUMBER, "duration": _NUMBER}.get(qt)
+
+        def on_same_topic(c, d):
+            cq, dq = own & c[3], own & d[3]
+            if typed and typed.search(c[1]) and typed.search(d[1]) and cq & dq:
+                return True  # two values of the attribute being asked about, for the same subject: the later one wins
+            return _jaccard(key_stems(c[3]), key_stems(d[3])) >= 0.35 or (len(cq) >= 2 and len(cq & dq) / len(cq) >= 0.6)
         for i, c in enumerate(chosen):
             stale = any(
                 d[2].record.delivery_time > c[2].record.delivery_time
-                and _jaccard(key_stems(c[3]), key_stems(d[3])) >= 0.35
+                and on_same_topic(c, d)
                 and textutil.values_in(c[1]) and textutil.values_in(d[1])
                 and textutil.values_in(c[1]) != textutil.values_in(d[1])
                 for j, d in enumerate(chosen) if i != j)
@@ -291,9 +418,15 @@ def extractive_answer(question: str, as_of: str, hits: list[ScoredRecord], retri
     chosen.sort(key=lambda c: (c[2].record.delivery_time, c[2].record.id, c[4]))
     parts, sources = [], []
     for score, sent, h, stems, k, units in chosen:
+        sent = after_correction(sent)
+        who, org = author_of(h.record)
+        if attribute and who and not SPEAKER.match(sent):
+            sent = f"{who}{' (' + org + ')' if org else ''}: {sent}"  # say who actually said it
         parts.append(sent if sent.endswith((".", "!", "?", ")")) else sent + ".")
         # a sentence that introduces a list ("Summary:") brings its bullet items with it
         j = k + 1
+        if j < len(units) and not units[j][1] and units[j][0].endswith(":") and len(units[j][0].split()) <= 3:
+            j += 1  # "Summary:" header between the sentence and its items
         added = 0
         while j < len(units) and units[j][1] and added < 5:
             parts.append(units[j][0].rstrip(".") + ".")

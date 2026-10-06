@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from collections import Counter
 import json
 import os
 import re
@@ -353,9 +354,32 @@ class CorpusIndex:
                     continue
                 counts.setdefault(m.group(0).lower(), set()).add(r.record_id)
         people = {n for u in self.users for n in (str(u.get("real_name") or "").lower(),) if n}
+        # single words: "Acme", "Pinecrest", "Harbor" (capitalised in the middle of a sentence, in several records)
+        singles: dict[str, set[str]] = {}
+        cap_n: Counter = Counter()
+        mid_n: Counter = Counter()
+        lower_n: Counter = Counter()
+        known_first = {w for n in people for w in n.split()}
+        for r in self.records:
+            body = r.original_text
+            if r.source in ("meeting", "slack", "chatgpt", "dictation", "calendar"):
+                body = body.partition("] ")[2]
+            lower_n.update(re.findall(r"\b[a-z]{4,}\b", body))
+            for m in re.finditer(r"(?<=[a-z,;:] )[A-Z][a-z]{3,}\b", body):
+                w = m.group(0).lower()
+                if w in self._NOT_NAME or w in known_first or w in textutil.STOP:
+                    continue
+                singles.setdefault(w, set()).add(r.record_id)
+                cap_n[w] += 1
+                if body[m.start() - 2] not in ",;:":
+                    mid_n[w] += 1  # capitalised right after another word, i.e. not just starting a clause
+        # a name is (almost) always capitalised; "okay", "good", "board" are ordinary words that sometimes start a clause
+        singles = {w: ids for w, ids in singles.items() if lower_n[w] <= 0.25 * cap_n[w] and mid_n[w] >= 0.5 * cap_n[w]}
+        min_single = max(min_records + 1, 4)
         out = {p for p, ids in counts.items() if len(ids) >= min_records and p not in people}
         # keep the more specific phrase when one contains another with the same support
-        return {p for p in out if not any(p != q and p in q and len(counts[q]) >= 0.8 * len(counts[p]) for q in out)}
+        phrases = {p for p in out if not any(p != q and p in q and len(counts[q]) >= 0.8 * len(counts[p]) for q in out)}
+        return phrases | {w for w, ids in singles.items() if len(ids) >= min_single}
 
     def record_dates(self, rec: Record) -> set:
         """Calendar days a record is about (mentioned dates + calendar start)."""

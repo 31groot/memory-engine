@@ -210,6 +210,8 @@ class HybridRetriever:
                 tmp += 2.5
             if qdates and r.delivery_time.astimezone(LA).date() in qdates:
                 tmp += 1.0
+            if qdates and r.source == "calendar" and src_boost.get("calendar") and rd & qdates:
+                tmp += 6.0  # "what's on my calendar on Sep 22": every event on that day is a match
             if bridge_dates and (rd & bridge_dates):
                 if r.source == "calendar":
                     tmp += 6.0  # "what's on my calendar that day": the day itself is the match

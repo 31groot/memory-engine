@@ -36,37 +36,29 @@ def main() -> None:
         out_dir = Path(ns.out)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Regenerate outputs first so a fresh clone is fully reproducible.
-        memory_input = f"{ns.evals}/memory_train.jsonl"
-        memory_output = str(out_dir / "memory_answers.jsonl")
-        actions_input = f"{ns.evals}/actions_train.jsonl"
-        actions_output = str(out_dir / "action_predictions.jsonl")
-
-        print("\n$", sys.executable, "run.py", "memory", "--input", memory_input, "--output", memory_output, "--data", ns.data)
-        run_memory(memory_input, memory_output, ns.data)
-        print("\n$", sys.executable, "run.py", "actions", "--input", actions_input, "--output", actions_output, "--data", ns.data)
-        run_actions(actions_input, actions_output, ns.data)
-
-        commands = [
-            [sys.executable, "eval_harness/score_retrieval.py", "--gold", memory_input, "--answers", memory_output, "--out", str(out_dir / "results_retrieval.json")],
-            [sys.executable, "eval_harness/score_memory.py", "--gold", memory_input, "--answers", memory_output, "--judge", "none", "--out", str(out_dir / "results_memory.json")],
-            [sys.executable, "eval_harness/score_actions.py", "--gold", actions_input, "--predictions", actions_output, "--out", str(out_dir / "results_actions.json")],
-        ]
-        # Held-out split (never used while developing the rules) is scored the same way.
-        ho_mem, ho_act = f"{ns.evals}/memory_heldout.jsonl", f"{ns.evals}/actions_heldout.jsonl"
-        if Path(ho_mem).exists() and Path(ho_act).exists():
-            ho_mem_out, ho_act_out = str(out_dir / "memory_answers_heldout.jsonl"), str(out_dir / "action_predictions_heldout.jsonl")
-            run_memory(ho_mem, ho_mem_out, ns.data)
-            run_actions(ho_act, ho_act_out, ns.data)
+        # Every split is regenerated and scored the same way, so a fresh clone is fully reproducible.
+        #   train, heldout : DEVELOPMENT sets. Their failures were read and fixed against; treat as upper bounds.
+        #   fresh          : written before the answer-composer fixes (baseline in README) but read afterwards.
+        #   blind          : written last and run once, never tuned on. The closest thing here to a clean test.
+        splits = [("train", ""), ("heldout", "_heldout"), ("fresh", "_fresh"), ("blind", "_blind")]
+        commands = []
+        for name, suf in splits:
+            mem_in, act_in = f"{ns.evals}/memory_{name}.jsonl", f"{ns.evals}/actions_{name}.jsonl"
+            if not (Path(mem_in).exists() and Path(act_in).exists()):
+                continue
+            mem_out, act_out = str(out_dir / f"memory_answers{suf}.jsonl"), str(out_dir / f"action_predictions{suf}.jsonl")
+            print(f"\n== {name} ==")
+            run_memory(mem_in, mem_out, ns.data)
+            run_actions(act_in, act_out, ns.data)
+            tag = suf or "_train"
             commands += [
-                [sys.executable, "eval_harness/score_retrieval.py", "--gold", ho_mem, "--answers", ho_mem_out, "--out", str(out_dir / "heldout_retrieval.json")],
-                [sys.executable, "eval_harness/score_memory.py", "--gold", ho_mem, "--answers", ho_mem_out, "--judge", "none", "--out", str(out_dir / "heldout_memory.json")],
-                [sys.executable, "eval_harness/score_actions.py", "--gold", ho_act, "--predictions", ho_act_out, "--out", str(out_dir / "heldout_actions.json")],
+                [sys.executable, "eval_harness/score_retrieval.py", "--gold", mem_in, "--answers", mem_out, "--out", str(out_dir / f"retrieval{tag}.json")],
+                [sys.executable, "eval_harness/score_memory.py", "--gold", mem_in, "--answers", mem_out, "--judge", "none", "--out", str(out_dir / f"memory{tag}.json")],
+                [sys.executable, "eval_harness/score_actions.py", "--gold", act_in, "--predictions", act_out, "--out", str(out_dir / f"actions{tag}.json")],
             ]
         for cmd in commands:
             print("\n$", " ".join(cmd))
             subprocess.run(cmd, check=True)
-
 
 if __name__ == "__main__":
     main()
