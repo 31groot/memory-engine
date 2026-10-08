@@ -1,5 +1,7 @@
-
 __pycache__/
 *.py[cod]
 .venv/
 .env
+out/
+.pytest_cache/
+.mypy_cache/
